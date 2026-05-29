@@ -1,0 +1,4 @@
+job-ID  prior   name       user         state submit/start at     queue
+------  ------  ---------  -----------  ----- ------------------- ----------------
+201     0.55500 etl        carol        r     05/29/2026 10:00:00 all.q@node1
+202     0.00000 batch      dan          qw    05/29/2026 10:05:00
