@@ -1,0 +1,8 @@
+sample-validation:
+  image: python:3.11-slim
+  script:
+    - make sample-validation
+  artifacts:
+    when: always
+    paths:
+      - build/sample-validation/
