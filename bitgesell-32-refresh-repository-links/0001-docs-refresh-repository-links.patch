@@ -1,0 +1,65 @@
+From 4e68caf9b82c61c59a0b1b11679878aa5ee77267 Mon Sep 17 00:00:00 2001
+From: Gia <gia@conway.local>
+Date: Fri, 29 May 2026 14:25:02 +0700
+Subject: [PATCH] docs: refresh repository links
+
+---
+ debian.minimal/control   | 2 +-
+ debian.minimal/copyright | 2 +-
+ debian.qt/control        | 2 +-
+ doc/build-windows.md     | 2 +-
+ 4 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/debian.minimal/control b/debian.minimal/control
+index 8995d832b..281ae92a2 100644
+--- a/debian.minimal/control
++++ b/debian.minimal/control
+@@ -4,7 +4,7 @@ Priority: optional
+ Maintainer: Emma Wu <wuemma@protonmail.com>
+ Build-Depends: debhelper (>=11~), g++-11, pkg-config, dh-autoreconf, libevent-dev, libssl-dev, fakeroot, wget
+ Standards-Version: 4.1.4
+-Homepage: https://github.com/wu-emma/bitgesell
++Homepage: https://github.com/BitgesellOfficial/bitgesell
+ 
+ Package: bitgesell
+ Architecture: any
+diff --git a/debian.minimal/copyright b/debian.minimal/copyright
+index 7235ef128..7c60277c7 100644
+--- a/debian.minimal/copyright
++++ b/debian.minimal/copyright
+@@ -1,6 +1,6 @@
+ Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+ Upstream-Name: bitgesell
+-Source: https://github.com/wu-emma/bitgesell
++Source: https://github.com/BitgesellOfficial/bitgesell
+ #
+ # Please double check copyright with the licensecheck(1) command.
+ 
+diff --git a/debian.qt/control b/debian.qt/control
+index 9103a8c8f..f9b931982 100644
+--- a/debian.qt/control
++++ b/debian.qt/control
+@@ -4,7 +4,7 @@ Priority: optional
+ Maintainer: Mathias van Orton <it@bitgesell.ca>
+ Build-Depends: debhelper (>=11~), g++-11, pkg-config, dh-autoreconf, libevent-dev, libssl-dev, fakeroot, wget
+ Standards-Version: 4.1.4
+-Homepage: https://github.com/wu-emma/bitgesell
++Homepage: https://github.com/BitgesellOfficial/bitgesell
+ 
+ Package: bitgesell-qt
+ Architecture: any
+diff --git a/doc/build-windows.md b/doc/build-windows.md
+index bcd87896d..e768749c3 100644
+--- a/doc/build-windows.md
++++ b/doc/build-windows.md
+@@ -65,7 +65,7 @@ If you want to build the windows installer with `make deploy` you need [NSIS](ht
+ 
+ Acquire the source in the usual way:
+ 
+-    git clone https://github.com/Original-Tasty/bitgesell.git
++    git clone https://github.com/BitgesellOfficial/bitgesell.git
+     cd bitgesell
+ 
+ ## Building for 64-bit Windows
+-- 
+2.47.1
