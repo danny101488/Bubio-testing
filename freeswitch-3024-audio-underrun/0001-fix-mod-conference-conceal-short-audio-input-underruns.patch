@@ -1,0 +1,73 @@
+From cff0c3a4f35da71513b4b6a43ba2bb9ff874eb57 Mon Sep 17 00:00:00 2001
+From: Gia <gia@conway.local>
+Date: Fri, 29 May 2026 12:10:17 +0700
+Subject: [PATCH] fix(mod_conference): conceal short audio input underruns
+
+---
+ .../mod_conference/conference_member.c           |  1 +
+ .../applications/mod_conference/mod_conference.c | 16 ++++++++++++++++
+ .../applications/mod_conference/mod_conference.h |  2 ++
+ 3 files changed, 19 insertions(+)
+
+diff --git a/src/mod/applications/mod_conference/conference_member.c b/src/mod/applications/mod_conference/conference_member.c
+index c258e59..21b25bb 100644
+--- a/src/mod/applications/mod_conference/conference_member.c
++++ b/src/mod/applications/mod_conference/conference_member.c
+@@ -1815,6 +1815,7 @@ int conference_member_setup_media(conference_member_t *member, conference_obj_t
+ 	if (!member->frame_size) {
+ 		member->frame_size = SWITCH_RECOMMENDED_BUFFER_SIZE;
+ 		member->frame = switch_core_alloc(member->pool, member->frame_size);
++		member->last_frame = switch_core_alloc(member->pool, member->frame_size);
+ 		member->mux_frame = switch_core_alloc(member->pool, member->frame_size);
+ 	}
+ 
+
+diff --git a/src/mod/applications/mod_conference/mod_conference.c b/src/mod/applications/mod_conference/mod_conference.c
+index 4f03742..ef75a0f 100644
+--- a/src/mod/applications/mod_conference/mod_conference.c
++++ b/src/mod/applications/mod_conference/mod_conference.c
+@@ -52,6 +52,8 @@ conference_globals_t conference_globals = {0};
+ int EC = 0;
+ char *api_syntax = NULL;
+ 
++#define CONF_AUDIO_HOLDOVER_FRAMES 2
++
+ SWITCH_STANDARD_API(conference_api_main){
+ 	return conference_api_main_real(cmd, session, stream);
+ }
+@@ -375,6 +377,20 @@ void *SWITCH_THREAD_FUNC conference_thread_run(switch_thread_t *thread, void *ob
+ 			if (switch_buffer_inuse(imember->audio_buffer) >= bytes
+ 				&& (buf_read = (uint32_t) switch_buffer_read(imember->audio_buffer, imember->frame, bytes))) {
+ 				imember->read = buf_read;
++				if (imember->last_frame && buf_read <= imember->frame_size) {
++					memcpy(imember->last_frame, imember->frame, buf_read);
++					imember->last_read = buf_read;
++					imember->holdover_frames = 0;
++				}
++				conference_utils_member_set_flag_locked(imember, MFLAG_HAS_AUDIO);
++				ready++;
++			} else if (imember->last_frame && imember->last_read == bytes && imember->holdover_frames < CONF_AUDIO_HOLDOVER_FRAMES &&
++					   (conference_utils_member_test_flag(imember, MFLAG_TALKING) || imember->energy_level == 0 ||
++						conference_utils_test_flag(conference, CFLAG_AUDIO_ALWAYS))) {
++				/* Conceal short input underruns so a late member frame does not make the whole mix emit generated silence. */
++				memcpy(imember->frame, imember->last_frame, imember->last_read);
++				imember->read = imember->last_read;
++				imember->holdover_frames++;
+ 				conference_utils_member_set_flag_locked(imember, MFLAG_HAS_AUDIO);
+ 				ready++;
+ 			}
+diff --git a/src/mod/applications/mod_conference/mod_conference.h b/src/mod/applications/mod_conference/mod_conference.h
+index e45a921..1d4a742 100644
+--- a/src/mod/applications/mod_conference/mod_conference.h
++++ b/src/mod/applications/mod_conference/mod_conference.h
+@@ -804,6 +804,8 @@ struct conference_member {
+ 	uint8_t *frame;
+ 	uint8_t *last_frame;
+ 	uint32_t frame_size;
++	uint32_t last_read;
++	uint32_t holdover_frames;
+ 	uint8_t *mux_frame;
+ 	uint32_t read;
+ 	uint32_t vol_period;
+-- 
+2.47.1
