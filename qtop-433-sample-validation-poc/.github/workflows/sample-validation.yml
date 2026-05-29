@@ -1,0 +1,17 @@
+name: sample-validation
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  sample-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Run shared sample-validation gate
+        run: make sample-validation
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sample-validation
+          path: build/sample-validation
