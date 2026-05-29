@@ -1,0 +1,24 @@
+name: qtop-433-sample-validation
+
+on:
+  push:
+    paths:
+      - 'qtop-433-sample-validation-poc/**'
+      - '.github/workflows/qtop-433-sample-validation.yml'
+  pull_request:
+    paths:
+      - 'qtop-433-sample-validation-poc/**'
+      - '.github/workflows/qtop-433-sample-validation.yml'
+
+jobs:
+  sample-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Run qtop #433 proof gate
+        working-directory: qtop-433-sample-validation-poc
+        run: make sample-validation
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: qtop-433-sample-validation
+          path: qtop-433-sample-validation-poc/build/sample-validation
