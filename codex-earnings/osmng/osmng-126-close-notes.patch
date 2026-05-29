@@ -1,0 +1,401 @@
+diff --git a/app/services/changeset_service.py b/app/services/changeset_service.py
+index 18cb9ed..21a3c78 100644
+--- a/app/services/changeset_service.py
++++ b/app/services/changeset_service.py
+@@ -2,6 +2,7 @@ import asyncio
+ import logging
+ from asyncio import Event, TaskGroup
+ from contextlib import asynccontextmanager
++from dataclasses import dataclass
+ from datetime import datetime
+ from random import uniform
+ from time import monotonic
+@@ -26,7 +27,7 @@ from app.db import (
+ )
+ from app.exceptions.context import raise_for
+ from app.lib.audit import audit
+-from app.lib.auth.context import auth_user
++from app.lib.auth.context import auth_context, auth_user
+ from app.lib.http.retry import retry
+ from app.lib.telemetry.sentry import (
+     SENTRY_CHANGESET_MANAGEMENT_MONITOR,
+@@ -38,17 +39,31 @@ from app.models.db.changeset_comment import (
+     ChangesetComment,
+     changeset_comments_resolve_rich_text,
+ )
+-from app.models.types import ChangesetCommentId, ChangesetId, DisplayName, UserId
++from app.models.db.user import User
++from app.models.types import (
++    ChangesetCommentId,
++    ChangesetId,
++    DisplayName,
++    NoteId,
++    UserId,
++)
+ from app.queries.changeset_query import ChangesetQuery
+ from app.queries.user_query import UserQuery
+ from app.queries.user_subscription_query import UserSubscriptionQuery
+ from app.services.email_service import EmailService
++from app.services.note_service import NoteService
+ from app.services.user_subscription_service import UserSubscriptionService
+ 
+ _PROCESS_REQUEST_EVENT = Event()
+ _PROCESS_DONE_EVENT = Event()
+ 
+ 
++@dataclass(slots=True, frozen=True)
++class _NoteClosure:
++    note_id: NoteId
++    comment: str
++
++
+ class ChangesetService:
+     @staticmethod
+     async def create(tags: dict[str, str]) -> ChangesetId:
+@@ -107,12 +122,13 @@ class ChangesetService:
+     @staticmethod
+     async def close(changeset_id: ChangesetId):
+         """Close a changeset."""
+-        user_id = auth_user(required=True)['id']
++        user = auth_user(required=True)
++        user_id = user['id']
+ 
+         async with db(True) as conn:
+             row = await db_fetchrow(
+                 t"""
+-                    SELECT user_id, closed_at
++                    SELECT user_id, closed_at, tags
+                     FROM changeset
+                     WHERE id = {changeset_id}
+                 """,
+@@ -124,7 +140,8 @@ class ChangesetService:
+ 
+             changeset_user_id: UserId
+             closed_at: datetime | None
+-            changeset_user_id, closed_at = row
++            tags: dict[str, str]
++            changeset_user_id, closed_at, tags = row
+ 
+             if changeset_user_id != user_id:
+                 raise_for.changeset_access_denied()
+@@ -142,6 +159,8 @@ class ChangesetService:
+             )
+             await audit('close_changeset', conn, extra={'id': changeset_id})
+ 
++        await _close_changeset_notes(changeset_id, user, tags)
++
+     @staticmethod
+     @asynccontextmanager
+     async def context():
+@@ -272,18 +291,95 @@ async def _process_task():
+ 
+ async def _close_inactive():
+     """Close all inactive changesets."""
+-    rowcount = await db_update(
+-        'changeset',
+-        {'closed_at': t'statement_timestamp()', 'updated_at': t'DEFAULT'},
+-        where=t"""closed_at IS NULL AND (
+-                updated_at < statement_timestamp() - {CHANGESET_IDLE_TIMEOUT} OR
+-                (updated_at >= statement_timestamp() - {CHANGESET_IDLE_TIMEOUT} AND
+-                created_at < statement_timestamp() - {CHANGESET_OPEN_TIMEOUT})
+-            )""",
++    async with db(True) as conn:
++        async with await conn.execute(
++            t"""
++                UPDATE changeset
++                SET closed_at = statement_timestamp(), updated_at = DEFAULT
++                WHERE closed_at IS NULL AND (
++                    updated_at < statement_timestamp() - {CHANGESET_IDLE_TIMEOUT} OR
++                    (updated_at >= statement_timestamp() - {CHANGESET_IDLE_TIMEOUT} AND
++                    created_at < statement_timestamp() - {CHANGESET_OPEN_TIMEOUT})
++                )
++                RETURNING id, user_id, tags
++            """
++        ) as r:
++            rows = await r.fetchall()
++
++    rowcount = len(rows)
++    if not rowcount:
++        return
++
++    logging.debug('Closed %d inactive changesets', rowcount)
++
++    users = {
++        user['id']: user
++        for user in await UserQuery.find_by_ids([
++            user_id for _, user_id, _ in rows if user_id is not None
++        ])
++    }
++
++    for changeset_id, user_id, tags in rows:
++        if user_id is None:
++            continue
++        user = users.get(user_id)
++        if user is None:
++            logging.warning(
++                'Skipping note auto-close for changeset %d with missing user %d',
++                changeset_id,
++                user_id,
++            )
++            continue
++        await _close_changeset_notes(changeset_id, user, tags)
++
++
++def _note_closures_from_changeset_tags(tags: dict[str, str]) -> list[_NoteClosure]:
++    raw_note_ids = tags.get('closes:note')
++    if not raw_note_ids:
++        return []
++
++    default_comment = (
++        tags['closes:note:comment']
++        if 'closes:note:comment' in tags
++        else tags.get('comment', '')
+     )
+ 
+-    if rowcount:
+-        logging.debug('Closed %d inactive changesets', rowcount)
++    closures: list[_NoteClosure] = []
++    seen: set[NoteId] = set()
++    for raw_part in raw_note_ids.split(';'):
++        part = raw_part.strip()
++        if not part.isdecimal():
++            continue
++
++        note_id = NoteId(int(part))
++        if note_id <= 0 or note_id in seen:
++            continue
++
++        comment = tags.get(f'closes:note:{note_id}:comment', default_comment)
++        closures.append(_NoteClosure(note_id, comment))
++        seen.add(note_id)
++
++    return closures
++
++
++async def _close_changeset_notes(
++    changeset_id: ChangesetId, user: User, tags: dict[str, str]
++):
++    closures = _note_closures_from_changeset_tags(tags)
++    if not closures:
++        return
++
++    with auth_context(user):
++        for closure in closures:
++            closed = await NoteService.close_if_open(
++                closure.note_id, closure.comment
++            )
++            if not closed:
++                logging.debug(
++                    'Skipping unavailable note %d close from changeset %d',
++                    closure.note_id,
++                    changeset_id,
++                )
+ 
+ 
+ async def _delete_empty():
+diff --git a/app/services/note_service.py b/app/services/note_service.py
+index 123ce68..971b779 100644
+--- a/app/services/note_service.py
++++ b/app/services/note_service.py
+@@ -75,10 +75,21 @@ class NoteService:
+ 
+         return note_id
+ 
++    @staticmethod
++    async def close_if_open(note_id: NoteId, text: str) -> bool:
++        """Close a note if it is visible and open."""
++        return await NoteService.comment(
++            note_id, text, 'closed', ignore_unavailable=True
++        )
++
+     @staticmethod
+     async def comment(
+-        note_id: NoteId, text: str, event: GetCommentsResponse_Comment_Event
+-    ):
++        note_id: NoteId,
++        text: str,
++        event: GetCommentsResponse_Comment_Event,
++        *,
++        ignore_unavailable: cython.bint = False,
++    ) -> bool:
+         """Comment on a note."""
+         user = auth_user(required=True)
+         user_id = user['id']
+@@ -99,12 +110,16 @@ class NoteService:
+                 conn=conn,
+             )
+             if note is None:
++                if ignore_unavailable:
++                    return False
+                 raise_for.note_not_found(note_id)
+ 
+             updates: dict[str, Any] = {}
+ 
+             if event == 'closed':
+                 if note['closed_at'] is not None:
++                    if ignore_unavailable:
++                        return False
+                     raise_for.note_closed(note_id, note['closed_at'])
+                 updates['closed_at'] = t'statement_timestamp()'
+                 send_activity_email = True
+@@ -181,6 +196,8 @@ class NoteService:
+                 tg.create_task(_send_activity_email(note, comment))
+             tg.create_task(UserSubscriptionService.subscribe('note', note_id))
+ 
++        return True
++
+ 
+ async def _send_activity_email(note: Note, comment: NoteComment):
+     async def place_task():
+diff --git a/tests/controllers/test_api06_changeset.py b/tests/controllers/test_api06_changeset.py
+index ebd5cd1..f19fc2a 100644
+--- a/tests/controllers/test_api06_changeset.py
++++ b/tests/controllers/test_api06_changeset.py
+@@ -1,7 +1,7 @@
+ from datetime import datetime
+ 
+ import pytest
+-from annotated_types import Gt
++from annotated_types import Gt, Len
+ from httpx import AsyncClient
+ from starlette import status
+ 
+@@ -109,6 +109,94 @@ async def test_changeset_crud(client: AsyncClient):
+     assert '@max_lon' not in changeset
+ 
+ 
++async def test_changeset_close_closes_tagged_notes(client: AsyncClient):
++    client.headers['Authorization'] = 'User user1'
++
++    r = await client.post(
++        '/api/0.6/notes.json',
++        json={'lon': 0, 'lat': 0, 'text': 'Default close target'},
++    )
++    assert r.is_success, r.text
++    default_note_id = r.json()['properties']['id']
++
++    r = await client.post(
++        '/api/0.6/notes.json',
++        json={'lon': 1, 'lat': 1, 'text': 'Specific close target'},
++    )
++    assert r.is_success, r.text
++    specific_note_id = r.json()['properties']['id']
++
++    r = await client.post(
++        '/api/0.6/notes.json',
++        json={'lon': 2, 'lat': 2, 'text': 'Already closed target'},
++    )
++    assert r.is_success, r.text
++    closed_note_id = r.json()['properties']['id']
++
++    r = await client.post(
++        f'/api/0.6/notes/{closed_note_id}/close.json',
++        params={'text': 'Already closed comment'},
++    )
++    assert r.is_success, r.text
++
++    r = await client.put(
++        '/api/0.6/changeset/create',
++        content=XMLToDict.unparse({
++            'osm': {
++                'changeset': {
++                    'tag': [
++                        {'@k': 'comment', '@v': 'Default close comment'},
++                        {
++                            '@k': 'closes:note',
++                            '@v': (
++                                f'{default_note_id};{specific_note_id};'
++                                f'{closed_note_id}'
++                            ),
++                        },
++                        {
++                            '@k': f'closes:note:{specific_note_id}:comment',
++                            '@v': 'Specific close comment',
++                        },
++                    ]
++                }
++            }
++        }),
++    )
++    assert r.is_success, r.text
++    changeset_id = int(r.text)
++
++    r = await client.put(f'/api/0.6/changeset/{changeset_id}/close')
++    assert r.is_success, r.text
++    assert not r.content
++
++    r = await client.get(f'/api/0.6/notes/{default_note_id}.json')
++    assert r.is_success, r.text
++    props = r.json()['properties']
++    assert_model(props, {'status': 'closed', 'closed_at': str})
++    assert_model(
++        props['comments'][-1],
++        {'user': 'user1', 'action': 'closed', 'text': 'Default close comment'},
++    )
++
++    r = await client.get(f'/api/0.6/notes/{specific_note_id}.json')
++    assert r.is_success, r.text
++    props = r.json()['properties']
++    assert_model(props, {'status': 'closed', 'closed_at': str})
++    assert_model(
++        props['comments'][-1],
++        {'user': 'user1', 'action': 'closed', 'text': 'Specific close comment'},
++    )
++
++    r = await client.get(f'/api/0.6/notes/{closed_note_id}.json')
++    assert r.is_success, r.text
++    props = r.json()['properties']
++    assert_model(props, {'status': 'closed', 'comments': Len(2, 2)})
++    assert_model(
++        props['comments'][-1],
++        {'user': 'user1', 'action': 'closed', 'text': 'Already closed comment'},
++    )
++
++
+ async def test_changeset_upload(client: AsyncClient):
+     client.headers['Authorization'] = 'User user1'
+ 
+diff --git a/tests/services/test_changeset_service.py b/tests/services/test_changeset_service.py
+index fa37d04..56f7db6 100644
+--- a/tests/services/test_changeset_service.py
++++ b/tests/services/test_changeset_service.py
+@@ -10,9 +10,37 @@ from app.config import (
+ )
+ from app.db import db
+ from app.lib.time.date_utils import utcnow
+-from app.models.types import ChangesetId
++from app.models.types import ChangesetId, NoteId
+ from app.queries.changeset_query import ChangesetQuery
+-from app.services.changeset_service import ChangesetService
++from app.services.changeset_service import (
++    ChangesetService,
++    _note_closures_from_changeset_tags,
++)
++
++
++def test_note_closures_from_changeset_tags():
++    closures = _note_closures_from_changeset_tags({
++        'comment': 'Default close comment',
++        'closes:note': '123; 456;invalid;0;123',
++        'closes:note:456:comment': 'Specific close comment',
++    })
++
++    assert [(c.note_id, c.comment) for c in closures] == [
++        (NoteId(123), 'Default close comment'),
++        (NoteId(456), 'Specific close comment'),
++    ]
++
++
++def test_note_closures_from_changeset_tags_global_comment():
++    closures = _note_closures_from_changeset_tags({
++        'comment': 'Default close comment',
++        'closes:note': '123',
++        'closes:note:comment': 'Global close comment',
++    })
++
++    assert [(c.note_id, c.comment) for c in closures] == [
++        (NoteId(123), 'Global close comment')
++    ]
+ 
+ 
+ async def test_changeset_inactive_close():
